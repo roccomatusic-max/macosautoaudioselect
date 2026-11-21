@@ -9,6 +9,7 @@
 -- "DockAudio", to grant the Accessibility permission to.
 
 property baseWin : 0
+property openedItem : missing value
 
 on run
 	set baseWin to 0
@@ -138,22 +139,65 @@ on checkAccess()
 	return "ok" & tab & "ready"
 end checkAccess
 
+-- The processes that can own menu bar icons. Up to macOS 26 that is Control
+-- Center; from macOS 27 the icons belong to a separate "MenuBarAgent" process
+-- (the Sound panel itself still belongs to Control Center).
+on menuProcesses()
+	set procs to {}
+	tell application "System Events"
+		try
+			set end of procs to (first application process whose bundle identifier is "com.apple.controlcenter")
+		end try
+		try
+			if exists application process "MenuBarAgent" then set end of procs to application process "MenuBarAgent"
+		end try
+	end tell
+	return procs
+end menuProcesses
+
+-- Every menu bar icon of a process. Icons sit either directly in the menu bar
+-- or one level down inside a group, depending on the macOS version.
+on menuBarItemsOf(proc)
+	set found to {}
+	set barList to {}
+	try
+		tell application "System Events" to set barList to menu bars of proc
+	end try
+	repeat with mb in barList
+		set theBar to contents of mb
+		set kids to {}
+		try
+			tell application "System Events" to set kids to UI elements of theBar
+		end try
+		repeat with k in kids
+			set kid to contents of k
+			if (my axAttr(kid, "AXRole")) is "AXMenuBarItem" then
+				set end of found to kid
+			else
+				try
+					tell application "System Events" to set subItems to menu bar items of kid
+					repeat with s in subItems
+						set end of found to contents of s
+					end repeat
+				end try
+			end if
+		end repeat
+	end repeat
+	return found
+end menuBarItemsOf
+
 -- The Sound icon in the menu bar, or missing value.
 on findSoundItem()
 	set fallbackItem to missing value
-	tell application "System Events"
-		set proc to first application process whose bundle identifier is "com.apple.controlcenter"
-		set barList to menu bars of proc
-	end tell
-	repeat with mb in barList
-		set theBar to contents of mb
-		tell application "System Events" to set itemList to menu bar items of theBar
-		repeat with mbi in itemList
-			set theItem to contents of mbi
+	set procs to my menuProcesses()
+	repeat with p in procs
+		set candidates to my menuBarItemsOf(contents of p)
+		repeat with c in candidates
+			set theItem to contents of c
 			set itemIdent to my axAttr(theItem, "AXIdentifier")
 			if itemIdent is "com.apple.menuextra.sound" then return theItem
 			if fallbackItem is missing value then
-				if itemIdent contains "sound" then
+				if itemIdent contains "menuextra.sound" then
 					set fallbackItem to theItem
 				else
 					set itemDesc to my axAttr(theItem, "AXDescription")
@@ -163,7 +207,19 @@ on findSoundItem()
 			end if
 		end repeat
 	end repeat
-	return fallbackItem
+	if fallbackItem is not missing value then return fallbackItem
+	-- last resort: look through everything MenuBarAgent has (slow, ~10 s)
+	try
+		tell application "System Events"
+			if not (exists application process "MenuBarAgent") then return missing value
+			set everything to entire contents of application process "MenuBarAgent"
+		end tell
+		repeat with e in everything
+			set theItem to contents of e
+			if (my axAttr(theItem, "AXIdentifier")) is "com.apple.menuextra.sound" then return theItem
+		end repeat
+	end try
+	return missing value
 end findSoundItem
 
 on ccWindowCount()
@@ -192,6 +248,7 @@ end waitForPanel
 on openSoundPanel()
 	set soundItem to my findSoundItem()
 	if soundItem is missing value then error "NO_SOUND_ICON"
+	set openedItem to soundItem
 	set baseWin to my ccWindowCount()
 	try
 		tell application "System Events" to click soundItem
@@ -212,9 +269,15 @@ end openSoundPanel
 on closeSoundPanel()
 	try
 		if not (my panelIsOpen()) then return
-		set soundItem to my findSoundItem()
+		set soundItem to openedItem
+		if soundItem is missing value then set soundItem to my findSoundItem()
 		if soundItem is not missing value then
 			tell application "System Events" to click soundItem
+		end if
+		delay 0.8
+		-- still open: the panel has keyboard focus, Escape dismisses it
+		if my panelIsOpen() then
+			tell application "System Events" to key code 53
 		end if
 	end try
 end closeSoundPanel
@@ -223,6 +286,7 @@ end closeSoundPanel
 -- {label, identifier, value, element}. value is "1" for the selected device.
 on collectDevices()
 	set devs to {}
+	set named to {}
 	set others to {}
 	try
 		tell application "System Events"
@@ -241,12 +305,16 @@ on collectDevices()
 				set elIdent to my axAttr(el, "AXIdentifier")
 				if elRole is "AXCheckBox" then
 					set end of devs to {my labelFor(el, elIdent), elIdent, my axAttr(el, "AXValue"), el}
+					if elIdent contains "sound-device" then set end of named to (item -1 of devs)
 				else if elIdent contains "sound-device" then
 					set end of others to {my labelFor(el, elIdent), elIdent, my axAttr(el, "AXValue"), el}
 				end if
 			end repeat
 		end repeat
 	end try
+	-- rows marked as sound devices are the outputs; other checkboxes in the
+	-- panel (such as AirPods listening modes) are not
+	if (count of named) > 0 then return named
 	if (count of devs) is 0 then return others
 	return devs
 end collectDevices
@@ -405,15 +473,17 @@ on dumpUI()
 	set txt to "ok" & tab & "dump"
 	set txt to txt & linefeed & "columns: role | subrole | title | description | identifier | value"
 	try
-		tell application "System Events"
-			set proc to first application process whose bundle identifier is "com.apple.controlcenter"
-			set barList to menu bars of proc
-		end tell
-		repeat with mb in barList
-			set theBar to contents of mb
-			tell application "System Events" to set itemList to menu bar items of theBar
-			repeat with mbi in itemList
-				set txt to txt & linefeed & "menubar: " & my describe(contents of mbi)
+		set procs to my menuProcesses()
+		repeat with p in procs
+			set theProc to contents of p
+			set procName to "?"
+			try
+				tell application "System Events" to set procName to name of theProc
+			end try
+			set iconList to my menuBarItemsOf(theProc)
+			set txt to txt & linefeed & "process " & procName & ": " & (count of iconList) & " menu bar icons"
+			repeat with c in iconList
+				set txt to txt & linefeed & "  icon: " & my describe(contents of c)
 			end repeat
 		end repeat
 	on error errMsg

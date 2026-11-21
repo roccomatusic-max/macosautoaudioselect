@@ -111,6 +111,9 @@ a switch failed.
   events, retries) and the command-line interface.
 - `src/DockAudio.applescript` — the background applet; asks `dockaudio tick`
   what to do every 3 seconds and performs the clicks in the Sound menu.
+  The Sound icon is looked up in Control Center (macOS 26 and earlier) and in
+  MenuBarAgent (macOS 27 and later); the Sound panel is a Control Center
+  window on both.
 - `install.sh` — compiles the applet with `osacompile`, signs it ad hoc,
   installs a LaunchAgent that opens it at login.
 - `tests/test.sh` — exercises the decision logic with stand-ins for `ioreg`
