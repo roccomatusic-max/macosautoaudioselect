@@ -1,0 +1,18 @@
++-o Root  <class IORegistryEntry, id 0x100000100, retain 31>
+  +-o AppleT8112USBXHCI@00000000  <class AppleT8112USBXHCI, id 0x1000002f1, registered, matched, active, busy 0 (10 ms), retain 60>
+  | {
+  |   "IOClass" = "AppleT8112USBXHCI"
+  | }
+  | 
+  +-o AppleT8112USBXHCI@01000000  <class AppleT8112USBXHCI, id 0x1000002f8, registered, matched, active, busy 0 (63 ms), retain 72>
+    | {
+    |   "IOClass" = "AppleT8112USBXHCI"
+    | }
+    | 
+    +-o USB Receiver@01200000  <class IOUSBHostDevice, id 0x100000a11, registered, matched, active, busy 0 (3 ms), retain 30>
+        {
+          "idProduct" = 50475
+          "USB Product Name" = "USB Receiver"
+          "idVendor" = 1133
+        }
+        

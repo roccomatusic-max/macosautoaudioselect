@@ -1,0 +1,887 @@
+#!/bin/bash
+#
+# dockaudio — command-line tool and decision-maker for DockAudio.app
+#
+# DockAudio.app is a tiny background applet. Every few seconds it runs
+# `dockaudio tick`; this script works out whether the dock was just plugged in
+# or unplugged and answers with what should happen ("switch to this speaker").
+# The applet then does the one thing a shell script cannot: it clicks the
+# speaker in the macOS Sound menu.
+#
+# Written for the bash 3.2 and BSD tools that ship with macOS — nothing to
+# install.
+
+set -u
+
+VERSION="1.0.0"
+
+DIR="${DOCKAUDIO_DIR:-$HOME/Library/Application Support/DockAudio}"
+LOG="${DOCKAUDIO_LOG:-$HOME/Library/Logs/DockAudio.log}"
+CONFIG="$DIR/config"
+STATE="$DIR/state"
+CMDFILE="$DIR/command"
+HEARTBEAT="$DIR/heartbeat"
+
+IOREG="${DOCKAUDIO_IOREG:-/usr/sbin/ioreg}"
+SYSPROF="${DOCKAUDIO_SYSTEM_PROFILER:-/usr/sbin/system_profiler}"
+
+BUNDLE_ID="com.dockaudio.app"
+AGENT_LABEL="com.dockaudio.launcher"
+AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+
+TAB="$(printf '\t')"
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+
+log() {
+	mkdir -p "$(dirname "$LOG")" 2>/dev/null
+	printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG" 2>/dev/null
+}
+
+# key=value files. Values are everything after the first "=", taken literally,
+# so speaker names with spaces or apostrophes need no quoting.
+kv_get() { # file key
+	[ -f "$1" ] || return 0
+	awk -v k="$2" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$1"
+}
+
+kv_set() { # file key value
+	local f="$1" k="$2" v="$3" tmp
+	mkdir -p "$(dirname "$f")"
+	tmp="$f.tmp.$$"
+	{
+		if [ -f "$f" ]; then awk -v k="$k" 'index($0, k "=") != 1' "$f"; fi
+		printf '%s=%s\n' "$k" "$v"
+	} >"$tmp" && mv -f "$tmp" "$f"
+}
+
+cfg() { kv_get "$CONFIG" "$1"; }
+cfg_set() { kv_set "$CONFIG" "$1" "$2"; }
+st() { kv_get "$STATE" "$1"; }
+st_set() { kv_set "$STATE" "$1" "$2"; }
+
+cfg_num() { # key default — numeric setting with a fallback
+	local v
+	v="$(cfg "$1")"
+	case "$v" in '' | *[!0-9]*) v="$2" ;; esac
+	printf '%s' "$v"
+}
+
+# ---------------------------------------------------------------------------
+# what is plugged in / what is playing
+# ---------------------------------------------------------------------------
+
+# Reads `ioreg -l` output, prints one line per USB device:
+#   vendor:product:serial<TAB>name
+usb_parse() {
+	awk '
+		function value(line,   v) {
+			v = line
+			sub(/^[^=]*= /, "", v)
+			gsub(/^"|"[ \t]*$/, "", v)
+			return v
+		}
+		function flush() {
+			if (vid != "" && pid != "") {
+				gsub(/[^A-Za-z0-9._-]/, "_", serial)
+				printf "%04x:%04x:%s\t%s\n", vid + 0, pid + 0, serial, (pname != "" ? pname : node)
+			}
+			vid = ""; pid = ""; serial = ""; pname = ""
+		}
+		/\+-o / {
+			flush()
+			node = $0
+			sub(/^.*\+-o /, "", node)
+			sub(/[ ]+<class.*$/, "", node)
+			sub(/@[0-9A-Fa-f,]*$/, "", node)
+			next
+		}
+		/^[ |]*"idVendor" = /               { vid = value($0) }
+		/^[ |]*"idProduct" = /              { pid = value($0) }
+		/^[ |]*"USB Serial Number" = /      { serial = value($0) }
+		/^[ |]*"kUSBSerialNumberString" = / { if (serial == "") serial = value($0) }
+		/^[ |]*"USB Product Name" = /       { pname = value($0) }
+		/^[ |]*"kUSBProductString" = /      { if (pname == "") pname = value($0) }
+		END { flush() }
+	'
+}
+
+usb_list() {
+	local found
+	found="$("$IOREG" -p IOUSB -l -w 0 2>/dev/null | usb_parse)"
+	if [ -z "$found" ]; then
+		found="$("$IOREG" -r -c IOUSBHostDevice -l -w 0 2>/dev/null | usb_parse)"
+	fi
+	if [ -n "$found" ]; then printf '%s\n' "$found" | sort -u; fi
+}
+
+# Prints 1 when enough of the dock's USB devices are present, else 0.
+is_docked() {
+	local ids min present id n=0
+	ids="$(cfg DOCK_IDS)"
+	if [ -z "$ids" ]; then
+		echo 0
+		return
+	fi
+	min="$(cfg_num DOCK_MIN_MATCH 1)"
+	present="$(usb_list | cut -f1)"
+	for id in $ids; do
+		if printf '%s\n' "$present" | grep -qxF -e "$id"; then n=$((n + 1)); fi
+	done
+	if [ "$n" -ge "$min" ]; then echo 1; else echo 0; fi
+}
+
+# Prints "name<TAB>transport" of the current default sound output, or nothing
+# if it cannot be determined. transport is "airplay" for AirPlay speakers.
+current_output() {
+	"$SYSPROF" SPAudioDataType -json 2>/dev/null | awk '
+		function strval(line,   v) {
+			v = line
+			sub(/^[^:]*:[ \t]*"/, "", v)
+			sub(/",?[ \t]*$/, "", v)
+			gsub(/\\\//, "/", v)
+			gsub(/\\"/, "\"", v)
+			return v
+		}
+		function flush() {
+			if (isdef && !done) { printf "%s\t%s\n", name, transport; done = 1 }
+			name = ""; transport = ""; isdef = 0
+		}
+		/^[ \t]*"_name"[ \t]*:/ { flush(); name = strval($0); next }
+		/default_audio_output_device"[ \t]*:/ { if (tolower($0) ~ /yes/) isdef = 1; next }
+		/device_transport"[ \t]*:/ {
+			transport = tolower(strval($0))
+			if (transport ~ /airplay/) transport = "airplay"
+			next
+		}
+		END { flush() }
+	'
+}
+
+# ---------------------------------------------------------------------------
+# the automatic part: called by the applet
+# ---------------------------------------------------------------------------
+
+want_set() { # name ident reason not-before
+	st_set want_name "$1"
+	st_set want_ident "$2"
+	st_set want_reason "$3"
+	st_set want_next "$4"
+	st_set want_attempts 0
+}
+
+want_clear() {
+	if [ -n "$(st want_name)" ]; then st_set want_name ""; fi
+}
+
+switch_succeeded() { # name reason how
+	local vol
+	log "now playing through '$1' ($3)"
+	case "$2" in
+	dock | startup | wake)
+		vol="$(cfg DOCK_VOLUME)"
+		case "$vol" in
+		'' | *[!0-9]*) ;;
+		*)
+			if [ "$vol" -le 100 ]; then
+				/usr/bin/osascript -e "set volume output volume $vol" >/dev/null 2>&1
+				log "volume set to $vol"
+			fi
+			;;
+		esac
+		;;
+	esac
+	want_clear
+}
+
+# Prints exactly one line for the applet:
+#   none
+#   <action><TAB><request id><TAB><arg><TAB><arg>
+cmd_tick() {
+	local now prev gap line id cmd a1 a2
+	mkdir -p "$DIR"
+	now="$(date +%s)"
+	prev="$(cat "$HEARTBEAT" 2>/dev/null)"
+	case "$prev" in '' | *[!0-9]*) prev="$now" ;; esac
+	printf '%s\n' "$now" >"$HEARTBEAT"
+	gap=$((now - prev))
+
+	# 1. a request from the command line (setup, test, list, ...)
+	if [ -f "$CMDFILE" ]; then
+		line="$(head -n 1 "$CMDFILE")"
+		rm -f "$CMDFILE"
+		id="$(printf '%s' "$line" | cut -f1)"
+		cmd="$(printf '%s' "$line" | cut -f2)"
+		a1="$(printf '%s' "$line" | cut -f3)"
+		a2="$(printf '%s' "$line" | cut -f4)"
+		case "$cmd" in
+		list | dump | check | quit | switch)
+			printf '%s\t%s\t%s\t%s\n' "$cmd" "$id" "$a1" "$a2"
+			return 0
+			;;
+		esac
+	fi
+
+	# 2. nothing to do until setup has been run
+	local speaker
+	speaker="$(cfg SPEAKER_NAME)"
+	if [ -z "$speaker" ] || [ -z "$(cfg DOCK_IDS)" ]; then
+		echo none
+		return 0
+	fi
+
+	# 3. did the dock appear or disappear?
+	local raw committed flips event=""
+	raw="$(is_docked)"
+	committed="$(st docked)"
+	flips="$(st flips)"
+	case "$flips" in '' | *[!0-9]*) flips=0 ;; esac
+
+	if [ -z "$committed" ]; then
+		# first look since the app started
+		st_set docked "$raw"
+		st_set flips 0
+		if [ "$raw" = 1 ]; then event=startup; fi
+	elif [ "$raw" != "$committed" ]; then
+		# only believe a change once it has been seen on consecutive checks,
+		# so a hub that blips for a second does not count as an unplug
+		flips=$((flips + 1))
+		if [ "$flips" -ge "$(cfg_num DEBOUNCE_TICKS 2)" ]; then
+			st_set docked "$raw"
+			st_set flips 0
+			if [ "$raw" = 1 ]; then event=dock; else event=undock; fi
+		else
+			st_set flips "$flips"
+		fi
+	else
+		if [ "$flips" != 0 ]; then st_set flips 0; fi
+		# a long silence means the Mac was asleep; AirPlay drops during sleep
+		if [ "$raw" = 1 ] && [ "$gap" -ge "$(cfg_num WAKE_GAP_SECONDS 90)" ] &&
+			[ "$(cfg_num REAPPLY_ON_WAKE 1)" = 1 ]; then
+			event=wake
+		fi
+	fi
+
+	local undock_to
+	case "$event" in
+	startup | dock | wake)
+		log "event: $event — dock is connected"
+		want_set "$speaker" "$(cfg SPEAKER_IDENT)" "$event" $((now + $(cfg_num DOCK_SETTLE_SECONDS 3)))
+		;;
+	undock)
+		undock_to="$(cfg UNDOCK_OUTPUT)"
+		if [ -n "$undock_to" ]; then
+			log "event: undock — dock was disconnected"
+			want_set "$undock_to" "$(cfg UNDOCK_IDENT)" undock "$now"
+		else
+			log "event: undock — dock was disconnected (nothing to do)"
+			want_clear
+		fi
+		;;
+	esac
+
+	# 4. is there a switch we still owe?
+	local wname wident wreason wnext watt max cur curname curtrans
+	wname="$(st want_name)"
+	if [ -z "$wname" ]; then
+		echo none
+		return 0
+	fi
+	wnext="$(st want_next)"
+	case "$wnext" in '' | *[!0-9]*) wnext=0 ;; esac
+	if [ "$now" -lt "$wnext" ]; then
+		echo none
+		return 0
+	fi
+	wident="$(st want_ident)"
+	wreason="$(st want_reason)"
+
+	cur="$(current_output)"
+	curname="${cur%%"$TAB"*}"
+	curtrans=""
+	case "$cur" in *"$TAB"*) curtrans="${cur#*"$TAB"}" ;; esac
+
+	if [ "$wreason" = undock ] && [ -n "$curname" ] &&
+		[ "$curname" != "$speaker" ] && [ "$curtrans" != airplay ]; then
+		# you were on headphones or similar, not the room speaker: leave it be
+		log "undock: output is '$curname', not the dock speaker — leaving it alone"
+		want_clear
+		echo none
+		return 0
+	fi
+
+	if [ -n "$curname" ] && [ "$curname" = "$wname" ]; then
+		switch_succeeded "$wname" "$wreason" "already the output"
+		echo none
+		return 0
+	fi
+
+	watt="$(st want_attempts)"
+	case "$watt" in '' | *[!0-9]*) watt=0 ;; esac
+	watt=$((watt + 1))
+	max="$(cfg_num MAX_ATTEMPTS 6)"
+	if [ "$watt" -gt "$max" ]; then
+		log "giving up on '$wname' after $max attempts — see earlier lines for why"
+		want_clear
+		echo none
+		return 0
+	fi
+	st_set want_attempts "$watt"
+	st_set want_next $((now + $(cfg_num RETRY_GAP_SECONDS 10)))
+	log "switching to '$wname' ($wreason, attempt $watt of $max)"
+	printf 'switch\tauto\t%s\t%s\n' "$wname" "$wident"
+	return 0
+}
+
+# The applet reports back how an action went.
+cmd_result() { # id payload
+	local id="${1:-}" payload="${2:-}" first status msg now
+	mkdir -p "$DIR"
+	if [ "$id" != auto ]; then
+		printf '%s\n' "$payload" >"$DIR/result.$id.tmp" && mv -f "$DIR/result.$id.tmp" "$DIR/result.$id"
+		return 0
+	fi
+	first="$(printf '%s\n' "$payload" | head -n 1)"
+	status="${first%%"$TAB"*}"
+	msg=""
+	case "$first" in *"$TAB"*) msg="${first#*"$TAB"}" ;; esac
+	now="$(date +%s)"
+	case "$status" in
+	ok)
+		switch_succeeded "$(st want_name)" "$(st want_reason)" "$msg"
+		;;
+	clicked)
+		# clicked but not confirmed in the menu; the next tick checks the
+		# actual output device and retries if it did not take
+		log "clicked '$(st want_name)', confirming…"
+		st_set want_next $((now + 4))
+		;;
+	*)
+		case "$msg" in
+		NO_ACCESSIBILITY* | NO_AUTOMATION* | NO_SOUND_ICON*)
+			log "cannot switch: $msg — run 'dockaudio setup' to fix this"
+			want_clear
+			;;
+		*)
+			log "attempt failed: $msg"
+			st_set want_next $((now + 8))
+			;;
+		esac
+		;;
+	esac
+	return 0
+}
+
+cmd_app_started() {
+	local size
+	mkdir -p "$DIR"
+	# keep the log from growing forever
+	if [ -f "$LOG" ]; then
+		size="$(wc -c <"$LOG" | tr -d ' ')"
+		if [ "${size:-0}" -gt 524288 ]; then
+			tail -n 500 "$LOG" >"$LOG.tmp" && mv -f "$LOG.tmp" "$LOG"
+		fi
+	fi
+	# forget the last known dock state so being docked at login counts
+	st_set docked ""
+	st_set flips 0
+	st_set want_name ""
+	rm -f "$CMDFILE" "$DIR"/result.*
+	log "DockAudio $VERSION started"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# talking to the applet from the command line
+# ---------------------------------------------------------------------------
+
+app_path() {
+	local self link dir cand
+	self="$0"
+	while [ -L "$self" ]; do
+		link="$(readlink "$self")"
+		case "$link" in
+		/*) self="$link" ;;
+		*) self="$(dirname "$self")/$link" ;;
+		esac
+	done
+	dir="$(cd "$(dirname "$self")/../.." 2>/dev/null && pwd)"
+	case "$dir" in
+	*.app)
+		printf '%s\n' "$dir"
+		return 0
+		;;
+	esac
+	for cand in "$HOME/Applications/DockAudio.app" "/Applications/DockAudio.app"; do
+		if [ -d "$cand" ]; then
+			printf '%s\n' "$cand"
+			return 0
+		fi
+	done
+	return 1
+}
+
+heartbeat_age() {
+	local hb
+	hb="$(cat "$HEARTBEAT" 2>/dev/null)"
+	case "$hb" in '' | *[!0-9]*)
+		echo 999999
+		return
+		;;
+	esac
+	echo $(($(date +%s) - hb))
+}
+
+app_start() {
+	local app i=0
+	if [ "$(heartbeat_age)" -le 6 ]; then return 0; fi
+	app="$(app_path)" || {
+		echo "DockAudio.app is not installed. Run install.sh first." >&2
+		return 1
+	}
+	/usr/bin/open -g "$app" || return 1
+	while [ $i -lt 30 ]; do
+		if [ "$(heartbeat_age)" -le 6 ]; then return 0; fi
+		sleep 0.5
+		i=$((i + 1))
+	done
+	echo "DockAudio.app was launched but is not responding." >&2
+	return 1
+}
+
+app_stop() {
+	if [ "$(heartbeat_age)" -le 40 ]; then
+		REQ_TIMEOUT=8 request quit >/dev/null 2>&1
+	fi
+	/usr/bin/pkill -f "DockAudio.app/Contents/MacOS/" >/dev/null 2>&1
+	rm -f "$HEARTBEAT"
+	return 0
+}
+
+# Sends a request to the applet and prints its answer.
+request() { # cmd [arg1] [arg2]
+	local id timeout i=0
+	id="r$$x$(date +%s)"
+	timeout="${REQ_TIMEOUT:-60}"
+	mkdir -p "$DIR"
+	rm -f "$DIR"/result.*
+	printf '%s\t%s\t%s\t%s\n' "$id" "$1" "${2:-}" "${3:-}" >"$CMDFILE.tmp" && mv -f "$CMDFILE.tmp" "$CMDFILE"
+	while [ $i -lt $((timeout * 2)) ]; do
+		if [ -f "$DIR/result.$id" ]; then
+			cat "$DIR/result.$id"
+			rm -f "$DIR/result.$id"
+			return 0
+		fi
+		sleep 0.5
+		i=$((i + 1))
+	done
+	rm -f "$CMDFILE"
+	return 1
+}
+
+# Splits an applet answer into ANSWER_STATUS / ANSWER_MSG / ANSWER_BODY.
+parse_answer() {
+	local first
+	first="$(printf '%s\n' "$1" | head -n 1)"
+	ANSWER_STATUS="${first%%"$TAB"*}"
+	ANSWER_MSG=""
+	case "$first" in *"$TAB"*) ANSWER_MSG="${first#*"$TAB"}" ;; esac
+	ANSWER_BODY="$(printf '%s\n' "$1" | tail -n +2)"
+}
+
+explain_failure() { # message
+	case "$1" in
+	NO_ACCESSIBILITY*) echo "DockAudio is not allowed to control the Sound menu yet (Accessibility permission). Run: dockaudio setup" ;;
+	NO_AUTOMATION*) echo "DockAudio is not allowed to use System Events yet (Automation permission). Run: dockaudio setup" ;;
+	NO_SOUND_ICON*) echo "The Sound icon is not in the menu bar. Run: dockaudio setup" ;;
+	*) echo "$1" ;;
+	esac
+}
+
+# ---------------------------------------------------------------------------
+# setup
+# ---------------------------------------------------------------------------
+
+say() { printf '%s\n' "$*"; }
+ask() { # prompt → REPLY
+	printf '%s ' "$1"
+	IFS= read -r REPLY || REPLY=""
+}
+
+open_pane() { /usr/bin/open "x-apple.systempreferences:com.apple.preference.security?$1" >/dev/null 2>&1; }
+
+setup_permissions() {
+	local answer tried_icon=0 told_access=0 waited=0 silent=0
+	say ""
+	say "Step 1 of 3 — permissions"
+	say "  If macOS asks whether DockAudio may control \"System Events\", click Allow."
+	while :; do
+		answer="$(REQ_TIMEOUT=30 request check)" || {
+			# the app waits while a macOS permission dialog is on screen
+			silent=$((silent + 1))
+			if [ "$silent" -ge 6 ]; then
+				say "  DockAudio.app is not answering. Try: dockaudio restart, then dockaudio setup"
+				return 1
+			fi
+			say "  Waiting — is a macOS dialog asking about DockAudio? Click Allow."
+			continue
+		}
+		silent=0
+		parse_answer "$answer"
+		if [ "$ANSWER_STATUS" = ok ]; then
+			say "  Permissions look good."
+			return 0
+		fi
+		case "$ANSWER_MSG" in
+		NO_AUTOMATION*)
+			say "  macOS blocked DockAudio from using System Events."
+			say "  In the window that just opened: Automation → DockAudio → turn on System Events."
+			open_pane Privacy_Automation
+			ask "  Press Return when done…"
+			;;
+		NO_ACCESSIBILITY*)
+			if [ "$told_access" = 0 ]; then
+				told_access=1
+				say "  DockAudio needs permission to click the Sound menu for you."
+				say "  In the window that just opened (Privacy & Security → Accessibility),"
+				say "  turn on the switch next to DockAudio. Waiting for you…"
+				open_pane Privacy_Accessibility
+			fi
+			sleep 3
+			waited=$((waited + 3))
+			# some macOS versions only notice the new permission after a relaunch
+			if [ $((waited % 30)) = 0 ]; then
+				app_stop
+				app_start || return 1
+			fi
+			if [ "$waited" -ge 300 ]; then
+				say "  Still not allowed after 5 minutes. Run 'dockaudio setup' again when ready."
+				return 1
+			fi
+			;;
+		NO_SOUND_ICON*)
+			if [ "$tried_icon" = 0 ]; then
+				tried_icon=1
+				say "  Putting the Sound icon in the menu bar (DockAudio clicks it for you)…"
+				/usr/bin/defaults -currentHost write com.apple.controlcenter Sound -int 18 >/dev/null 2>&1
+				/usr/bin/killall ControlCenter >/dev/null 2>&1
+				sleep 4
+			else
+				say "  The Sound icon still is not in the menu bar. Please turn it on:"
+				say "    macOS 26:        System Settings → Menu Bar → Sound → on"
+				say "    macOS 15 and up: System Settings → Control Center → Sound → Always Show in Menu Bar"
+				ask "  Press Return when done…"
+			fi
+			;;
+		*)
+			say "  Unexpected problem: $ANSWER_MSG"
+			ask "  Press Return to try again, or Ctrl-C to stop…"
+			;;
+		esac
+	done
+}
+
+# Asks the applet what the Sound menu offers. Fills DEV_LABELS / DEV_IDENTS /
+# DEV_ON (newline-separated, same order).
+fetch_devices() {
+	local answer
+	say "  Looking at your Sound menu (it will open by itself for a few seconds)…"
+	answer="$(REQ_TIMEOUT=60 request list)" || {
+		say "  DockAudio.app is not answering. Try: dockaudio restart"
+		return 1
+	}
+	parse_answer "$answer"
+	if [ "$ANSWER_STATUS" != ok ]; then
+		say "  $(explain_failure "$ANSWER_MSG")"
+		return 1
+	fi
+	DEVICES="$(printf '%s\n' "$ANSWER_BODY" | awk -F'\t' '$1 != ""')"
+	if [ -z "$DEVICES" ]; then
+		say "  The Sound menu opened but no output devices could be read from it."
+		say "  Please run 'dockaudio dump > dump.txt' and share that file so this can be fixed."
+		return 1
+	fi
+	return 0
+}
+
+print_devices() {
+	printf '%s\n' "$DEVICES" | awk -F'\t' '{
+		mark = ($3 == "1" || $3 == "true") ? "  (current)" : ""
+		printf "    %d) %s%s\n", NR, $1, mark
+	}'
+}
+
+device_field() { # row-number field-number
+	printf '%s\n' "$DEVICES" | awk -F'\t' -v n="$1" -v f="$2" 'NR == n { print $f }'
+}
+
+setup_speaker() {
+	local count pick
+	say ""
+	say "Step 2 of 3 — which speaker?"
+	say "  Make sure the Sonos is powered on. It appears here if it supports AirPlay"
+	say "  (most Sonos speakers from 2018 on do)."
+	while :; do
+		fetch_devices || return 1
+		count="$(printf '%s\n' "$DEVICES" | wc -l | tr -d ' ')"
+		say ""
+		print_devices
+		say ""
+		ask "  Number of the speaker to use when docked (or r to look again):"
+		case "$REPLY" in
+		r | R | '') continue ;;
+		*[!0-9]*) continue ;;
+		esac
+		pick="$REPLY"
+		if [ "$pick" -ge 1 ] && [ "$pick" -le "$count" ]; then break; fi
+	done
+	cfg_set SPEAKER_NAME "$(device_field "$pick" 1)"
+	cfg_set SPEAKER_IDENT "$(device_field "$pick" 2)"
+	say "  Docked speaker: $(cfg SPEAKER_NAME)"
+
+	say ""
+	say "  When you unplug from the dock, switch back to which output?"
+	print_devices
+	say "    0) Don't switch — leave the sound where it is"
+	while :; do
+		ask "  Number (usually your MacBook speakers):"
+		case "$REPLY" in '' | *[!0-9]*) continue ;; esac
+		if [ "$REPLY" -ge 0 ] && [ "$REPLY" -le "$count" ]; then break; fi
+	done
+	if [ "$REPLY" = 0 ]; then
+		cfg_set UNDOCK_OUTPUT ""
+		cfg_set UNDOCK_IDENT ""
+		say "  On unplug: leave the output alone"
+	else
+		cfg_set UNDOCK_OUTPUT "$(device_field "$REPLY" 1)"
+		cfg_set UNDOCK_IDENT "$(device_field "$REPLY" 2)"
+		say "  On unplug: $(cfg UNDOCK_OUTPUT)"
+	fi
+	return 0
+}
+
+setup_dock() {
+	local with without ids names n min
+	with="$DIR/usb.with.$$"
+	without="$DIR/usb.without.$$"
+	say ""
+	say "Step 3 of 3 — which dock?"
+	say "  DockAudio recognises the dock by the USB devices inside it, so it needs"
+	say "  to see your Mac once with the dock and once without."
+	while :; do
+		ask "  Is the dock plugged in right now? [y/n]"
+		case "$REPLY" in
+		y | Y | yes)
+			usb_list >"$with"
+			ask "  Now UNPLUG the dock, wait 5 seconds, then press Return…"
+			usb_list >"$without"
+			;;
+		n | N | no)
+			usb_list >"$without"
+			ask "  Now PLUG IN the dock, wait 10 seconds, then press Return…"
+			usb_list >"$with"
+			;;
+		*) continue ;;
+		esac
+		# devices present with the dock but not without it
+		names="$(awk -F'\t' -v other="$without" '
+			BEGIN { while ((getline line < other) > 0) { split(line, f, "\t"); seen[f[1]] = 1 } }
+			!($1 in seen)' "$with")"
+		rm -f "$with" "$without"
+		if [ -n "$names" ]; then break; fi
+		say "  No difference seen between docked and undocked. Let's try once more —"
+		say "  give the dock a few more seconds after plugging it in."
+	done
+	ids="$(printf '%s\n' "$names" | cut -f1 | tr '\n' ' ' | sed 's/ *$//')"
+	n="$(printf '%s\n' "$names" | wc -l | tr -d ' ')"
+	# "docked" = at least half of these are present, so unplugging a mouse
+	# from the dock later does not confuse things
+	min=$(((n + 1) / 2))
+	cfg_set DOCK_IDS "$ids"
+	cfg_set DOCK_MIN_MATCH "$min"
+	say "  The dock is recognised by these $n device(s):"
+	printf '%s\n' "$names" | awk -F'\t' '{ printf "    - %s\n", $2 }'
+	return 0
+}
+
+cmd_setup() {
+	mkdir -p "$DIR"
+	say "DockAudio setup"
+	app_start || return 1
+	setup_permissions || return 1
+	setup_speaker || return 1
+	setup_dock || return 1
+	# make the running app re-evaluate from scratch
+	st_set docked ""
+	st_set want_name ""
+	say ""
+	say "All set. Plug into the dock and the sound moves to '$(cfg SPEAKER_NAME)' by itself."
+	say "The Sound menu will flick open for a second or two when it happens — that is DockAudio."
+	say ""
+	say "Useful commands:  dockaudio status | dockaudio test | dockaudio logs"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# everyday commands
+# ---------------------------------------------------------------------------
+
+cmd_status() {
+	local age cur
+	age="$(heartbeat_age)"
+	if [ "$age" -le 40 ]; then
+		say "App:            running"
+	else
+		say "App:            NOT running (start it with: dockaudio start)"
+	fi
+	say "Docked speaker: $(cfg SPEAKER_NAME)"
+	say "On unplug:      $(v="$(cfg UNDOCK_OUTPUT)"; echo "${v:-leave the output alone}")"
+	if [ -z "$(cfg DOCK_IDS)" ]; then
+		say "Dock:           not set up yet (run: dockaudio setup)"
+	elif [ "$(is_docked)" = 1 ]; then
+		say "Dock:           connected"
+	else
+		say "Dock:           not connected"
+	fi
+	cur="$(current_output)"
+	say "Sound output:   ${cur%%"$TAB"*}"
+	say "Settings file:  $CONFIG"
+	say "Log file:       $LOG"
+}
+
+cmd_test() { # [undock]
+	local name ident answer
+	if [ "${1:-}" = undock ]; then
+		name="$(cfg UNDOCK_OUTPUT)"
+		ident="$(cfg UNDOCK_IDENT)"
+	else
+		name="$(cfg SPEAKER_NAME)"
+		ident="$(cfg SPEAKER_IDENT)"
+	fi
+	if [ -z "$name" ]; then
+		say "Nothing configured for that yet. Run: dockaudio setup"
+		return 1
+	fi
+	app_start || return 1
+	say "Switching to '$name'…"
+	answer="$(REQ_TIMEOUT=60 request switch "$name" "$ident")" || {
+		say "DockAudio.app is not answering. Try: dockaudio restart"
+		return 1
+	}
+	parse_answer "$answer"
+	case "$ANSWER_STATUS" in
+	ok) say "Done ($ANSWER_MSG)." ;;
+	clicked) say "Clicked it, but could not confirm it took. Check the Sound menu." ;;
+	*)
+		say "Failed: $(explain_failure "$ANSWER_MSG")"
+		return 1
+		;;
+	esac
+}
+
+cmd_switch() { # name
+	local answer
+	if [ -z "${1:-}" ]; then
+		say "Usage: dockaudio switch \"Speaker Name\""
+		return 1
+	fi
+	app_start || return 1
+	answer="$(REQ_TIMEOUT=60 request switch "$1" "")" || {
+		say "DockAudio.app is not answering. Try: dockaudio restart"
+		return 1
+	}
+	parse_answer "$answer"
+	case "$ANSWER_STATUS" in
+	ok | clicked) say "$ANSWER_STATUS: $ANSWER_MSG" ;;
+	*)
+		say "Failed: $(explain_failure "$ANSWER_MSG")"
+		return 1
+		;;
+	esac
+}
+
+cmd_list() {
+	app_start || return 1
+	fetch_devices || return 1
+	print_devices
+}
+
+cmd_dump() {
+	local answer
+	app_start || return 1
+	answer="$(REQ_TIMEOUT=90 request dump)" || {
+		echo "DockAudio.app is not answering. Try: dockaudio restart" >&2
+		return 1
+	}
+	echo "macOS $(/usr/bin/sw_vers -productVersion 2>/dev/null) — dockaudio $VERSION"
+	printf '%s\n' "$answer"
+}
+
+cmd_uninstall() {
+	local app
+	app="$(app_path 2>/dev/null)"
+	app_stop
+	/bin/launchctl bootout "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1
+	rm -f "$AGENT_PLIST"
+	rm -f "$HOME/.local/bin/dockaudio"
+	if [ -L /usr/local/bin/dockaudio ]; then rm -f /usr/local/bin/dockaudio 2>/dev/null; fi
+	/usr/bin/tccutil reset Accessibility "$BUNDLE_ID" >/dev/null 2>&1
+	/usr/bin/tccutil reset AppleEvents "$BUNDLE_ID" >/dev/null 2>&1
+	rm -rf "$DIR"
+	if [ -n "$app" ] && [ -d "$app" ]; then rm -rf "$app"; fi
+	echo "DockAudio has been removed."
+}
+
+usage() {
+	cat <<EOF
+dockaudio $VERSION — switch to your room speakers when you plug into the dock
+
+  dockaudio setup        choose the speaker and teach it your dock
+  dockaudio status       show what it currently sees
+  dockaudio test         switch to the docked speaker right now
+  dockaudio test undock  switch to the "unplugged" output right now
+  dockaudio list         show the outputs in your Sound menu
+  dockaudio logs         show recent activity
+  dockaudio start | stop | restart
+  dockaudio dump         describe the Sound menu (for troubleshooting)
+  dockaudio uninstall    remove everything
+EOF
+}
+
+main() {
+	local cmd="${1:-help}"
+	if [ $# -gt 0 ]; then shift; fi
+	case "$cmd" in
+	# called by the applet
+	tick) cmd_tick ;;
+	result) cmd_result "$@" ;;
+	app-started) cmd_app_started ;;
+	log) log "$*" ;;
+	# building blocks, handy for troubleshooting
+	usb) usb_list ;;
+	docked) is_docked ;;
+	current-output) current_output ;;
+	# for people
+	setup) cmd_setup ;;
+	status) cmd_status ;;
+	test) cmd_test "$@" ;;
+	switch) cmd_switch "$@" ;;
+	list) cmd_list ;;
+	dump) cmd_dump ;;
+	logs) tail -n "${1:-40}" "$LOG" 2>/dev/null || echo "No log yet." ;;
+	start) app_start && echo "DockAudio is running." ;;
+	stop) app_stop && echo "DockAudio stopped." ;;
+	restart) app_stop && app_start && echo "DockAudio restarted." ;;
+	uninstall) cmd_uninstall ;;
+	version | --version | -v) echo "$VERSION" ;;
+	help | --help | -h) usage ;;
+	*)
+		usage
+		return 1
+		;;
+	esac
+}
+
+main "$@"

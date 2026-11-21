@@ -1,0 +1,50 @@
++-o Root  <class IORegistryEntry, id 0x100000100, retain 31>
+  +-o AppleT8112USBXHCI@00000000  <class AppleT8112USBXHCI, id 0x1000002f1, registered, matched, active, busy 0 (10 ms), retain 60>
+  | {
+  |   "IOClass" = "AppleT8112USBXHCI"
+  |   "IOPersonalityPublisher" = "com.apple.driver.usb.AppleSynopsysUSB40XHCI"
+  | }
+  | 
+  +-o AppleT8112USBXHCI@01000000  <class AppleT8112USBXHCI, id 0x1000002f8, registered, matched, active, busy 0 (63 ms), retain 72>
+    | {
+    |   "IOClass" = "AppleT8112USBXHCI"
+    | }
+    | 
+    +-o CalDigit TS4 Hub@01100000  <class IOUSBHostDevice, id 0x100012a41, registered, matched, active, busy 0 (5 ms), retain 34>
+    | | {
+    | |   "sessionID" = 5283497631528
+    | |   "USBSpeed" = 4
+    | |   "idProduct" = 1349
+    | |   "iManufacturer" = 1
+    | |   "bDeviceClass" = 9
+    | |   "IOPowerManagement" = {"PowerOverrideOn"=Yes,"DevicePowerState"=2,"CurrentPowerState"=2,"CapabilityFlags"=32768,"MaxPowerState"=2,"DriverPowerState"=0}
+    | |   "USB Product Name" = "CalDigit TS4 Hub"
+    | |   "USB Vendor Name" = "CalDigit, Inc."
+    | |   "idVendor" = 8457
+    | |   "kUSBProductString" = "CalDigit TS4 Hub"
+    | | }
+    | | 
+    | +-o USB 10/100/1G/2.5G LAN@01110000  <class IOUSBHostDevice, id 0x100012a60, registered, matched, active, busy 0 (3 ms), retain 30>
+    | |   {
+    | |     "idProduct" = 33110
+    | |     "USB Product Name" = "USB 10/100/1G/2.5G LAN"
+    | |     "idVendor" = 3034
+    | |     "USB Serial Number" = "4013000001 A7"
+    | |     "kUSBSerialNumberString" = "4013000001 A7"
+    | |   }
+    | |   
+    | +-o Rocco’s Keyboard@01120000  <class IOUSBHostDevice, id 0x100012a77, registered, matched, active, busy 0 (3 ms), retain 30>
+    |     {
+    |       "idProduct" = 591
+    |       "kUSBProductString" = "Magic Keyboard"
+    |       "idVendor" = 1452
+    |       "kUSBSerialNumberString" = "F0T1234ABCD"
+    |     }
+    |     
+    +-o USB Receiver@01200000  <class IOUSBHostDevice, id 0x100000a11, registered, matched, active, busy 0 (3 ms), retain 30>
+        {
+          "idProduct" = 50475
+          "USB Product Name" = "USB Receiver"
+          "idVendor" = 1133
+        }
+        

@@ -1,0 +1,24 @@
+{
+  "SPAudioDataType" : [
+    {
+      "_items" : [
+        {
+          "_name" : "MacBook Pro Speakers",
+          "coreaudio_default_audio_system_device" : "spaudio_yes",
+          "coreaudio_device_manufacturer" : "Apple Inc.",
+          "coreaudio_device_output" : 2,
+          "coreaudio_device_transport" : "coreaudio_device_type_builtin"
+        },
+        {
+          "_name" : "Rocco's Room \/ Office",
+          "coreaudio_default_audio_output_device" : "spaudio_yes",
+          "coreaudio_device_manufacturer" : "Apple Inc.",
+          "coreaudio_device_output" : 2,
+          "coreaudio_device_srate" : 44100,
+          "coreaudio_device_transport" : "coreaudio_device_type_airplay"
+        }
+      ],
+      "_name" : "coreaudio_device"
+    }
+  ]
+}
