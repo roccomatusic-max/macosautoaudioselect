@@ -158,32 +158,32 @@ end menuProcesses
 -- Every menu bar icon of a process. Icons sit either directly in the menu bar
 -- or one level down inside a group, depending on the macOS version.
 on menuBarItemsOf(proc)
-	set found to {}
+	set iconItems to {}
 	set barList to {}
 	try
 		tell application "System Events" to set barList to menu bars of proc
 	end try
 	repeat with mb in barList
 		set theBar to contents of mb
-		set kids to {}
+		set barKids to {}
 		try
-			tell application "System Events" to set kids to UI elements of theBar
+			tell application "System Events" to set barKids to UI elements of theBar
 		end try
-		repeat with k in kids
+		repeat with k in barKids
 			set kid to contents of k
 			if (my axAttr(kid, "AXRole")) is "AXMenuBarItem" then
-				set end of found to kid
+				set end of iconItems to kid
 			else
 				try
 					tell application "System Events" to set subItems to menu bar items of kid
 					repeat with s in subItems
-						set end of found to contents of s
+						set end of iconItems to contents of s
 					end repeat
 				end try
 			end if
 		end repeat
 	end repeat
-	return found
+	return iconItems
 end menuBarItemsOf
 
 -- The Sound icon in the menu bar, or missing value.
@@ -212,9 +212,9 @@ on findSoundItem()
 	try
 		tell application "System Events"
 			if not (exists application process "MenuBarAgent") then return missing value
-			set everything to entire contents of application process "MenuBarAgent"
+			set allParts to entire contents of application process "MenuBarAgent"
 		end tell
-		repeat with e in everything
+		repeat with e in allParts
 			set theItem to contents of e
 			if (my axAttr(theItem, "AXIdentifier")) is "com.apple.menuextra.sound" then return theItem
 		end repeat
@@ -286,7 +286,7 @@ end closeSoundPanel
 -- {label, identifier, value, element}. value is "1" for the selected device.
 on collectDevices()
 	set devs to {}
-	set named to {}
+	set outputRows to {}
 	set others to {}
 	try
 		tell application "System Events"
@@ -305,7 +305,7 @@ on collectDevices()
 				set elIdent to my axAttr(el, "AXIdentifier")
 				if elRole is "AXCheckBox" then
 					set end of devs to {my labelFor(el, elIdent), elIdent, my axAttr(el, "AXValue"), el}
-					if elIdent contains "sound-device" then set end of named to (item -1 of devs)
+					if elIdent contains "sound-device" then set end of outputRows to (item -1 of devs)
 				else if elIdent contains "sound-device" then
 					set end of others to {my labelFor(el, elIdent), elIdent, my axAttr(el, "AXValue"), el}
 				end if
@@ -314,7 +314,7 @@ on collectDevices()
 	end try
 	-- rows marked as sound devices are the outputs; other checkboxes in the
 	-- panel (such as AirPods listening modes) are not
-	if (count of named) > 0 then return named
+	if (count of outputRows) > 0 then return outputRows
 	if (count of devs) is 0 then return others
 	return devs
 end collectDevices
